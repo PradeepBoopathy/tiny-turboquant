@@ -51,6 +51,10 @@ from .fused_attention import (
     run_split_k_comparison,
     save_split_k_json,
     save_split_k_markdown,
+    EndToEndDecodeBenchConfig,
+    run_end_to_end_decode_benchmark,
+    save_end_to_end_decode_json,
+    save_end_to_end_decode_markdown,
 )
 
 from .serving_sim import (
@@ -564,6 +568,43 @@ def split_k_compare(args: argparse.Namespace) -> int:
     print(json.dumps(report, indent=2))
     return 0
 
+
+def end_to_end_decode(args: argparse.Namespace) -> int:
+    cfg = EndToEndDecodeBenchConfig(
+        batch_size=args.batch_size,
+        heads=args.heads,
+        query_len=args.query_len,
+        prompt_lens=tuple(int(x) for x in args.prompt_lens),
+        decode_steps=args.decode_steps,
+        head_dim=args.head_dim,
+        page_size=args.page_size,
+        preset=args.preset,
+        device=args.device,
+        dtype=args.dtype,
+        warmup=args.warmup,
+        repeats=args.repeats,
+        seed=args.seed,
+        prefer_triton=not args.no_triton,
+        kernel_block_m=args.kernel_block_m,
+        kernel_num_warps=args.kernel_num_warps,
+        tune_kernel=args.tune_kernel,
+        tune_block_m_values=tuple(int(x) for x in args.tune_block_m_values),
+        tune_num_warps=args.tune_num_warps,
+        tune_num_warps_values=tuple(int(x) for x in args.tune_num_warps_values),
+        split_k_slabs=tuple(int(x) for x in args.split_k_slabs),
+        cuda_graph=args.cuda_graph,
+        graph_replays=args.graph_replays,
+        include_single_pass_loop=not args.no_single_pass_loop,
+        competitiveness_target=args.competitiveness_target,
+    )
+    report = run_end_to_end_decode_benchmark(cfg)
+    if args.report_json:
+        save_end_to_end_decode_json(report, args.report_json)
+    if args.report_md:
+        save_end_to_end_decode_markdown(report, args.report_md)
+    print(json.dumps(report, indent=2))
+    return 0
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="tiny-tq", description="tiny-turboquant utilities")
     sub = parser.add_subparsers(dest="cmd")
@@ -802,6 +843,37 @@ def build_parser() -> argparse.ArgumentParser:
     sk.add_argument("--report-json", type=str, default=None)
     sk.add_argument("--report-md", type=str, default=None)
     sk.set_defaults(func=split_k_compare)
+
+
+    ed = sub.add_parser("end-to-end-decode", help="v0.11.0 fixed-cache repeated decode-loop diagnostic")
+    ed.add_argument("--batch-size", type=int, default=1)
+    ed.add_argument("--heads", type=int, default=8)
+    ed.add_argument("--query-len", type=int, default=1)
+    ed.add_argument("--prompt-lens", nargs="+", type=int, default=[16384, 32768])
+    ed.add_argument("--decode-steps", type=int, default=32)
+    ed.add_argument("--head-dim", type=int, default=64)
+    ed.add_argument("--page-size", type=int, default=256)
+    ed.add_argument("--preset", type=str, default="safe-layout", choices=available_layout_presets())
+    ed.add_argument("--device", type=str, default="auto", choices=["auto", "cpu", "cuda"])
+    ed.add_argument("--dtype", type=str, default="auto", choices=["auto", "float16", "fp16", "bfloat16", "bf16", "float32", "fp32"])
+    ed.add_argument("--warmup", type=int, default=1)
+    ed.add_argument("--repeats", "--iters", dest="repeats", type=int, default=3)
+    ed.add_argument("--seed", type=int, default=123)
+    ed.add_argument("--kernel-block-m", type=int, default=64, choices=[8, 16, 32, 64, 128])
+    ed.add_argument("--kernel-num-warps", type=int, default=4, choices=[1, 2, 4, 8])
+    ed.add_argument("--tune-kernel", action="store_true")
+    ed.add_argument("--tune-block-m-values", nargs="+", type=int, default=[8, 16, 32, 64, 128])
+    ed.add_argument("--tune-num-warps", action="store_true")
+    ed.add_argument("--tune-num-warps-values", nargs="+", type=int, default=[1, 2, 4, 8])
+    ed.add_argument("--split-k-slabs", nargs="+", type=int, default=[2, 4, 8, 16])
+    ed.add_argument("--cuda-graph", action="store_true")
+    ed.add_argument("--graph-replays", type=int, default=100)
+    ed.add_argument("--competitiveness-target", type=str, default="sdpa", choices=["dense", "sdpa"])
+    ed.add_argument("--no-triton", action="store_true")
+    ed.add_argument("--no-single-pass-loop", action="store_true")
+    ed.add_argument("--report-json", type=str, default=None)
+    ed.add_argument("--report-md", type=str, default=None)
+    ed.set_defaults(func=end_to_end_decode)
 
 
     ss = sub.add_parser("serving-sim", help="simulate serving-style paged KV-cache memory for active users")

@@ -1197,3 +1197,51 @@ def test_v0106_1_reduce_split_k_partials_with_different_local_maxima():
     out = reduce_split_k_partials(partial_m, partial_l, partial_acc)
 
     assert torch.allclose(out.flatten(), expected.reshape(1), atol=1e-6)
+
+
+def test_v0110_end_to_end_decode_cpu_report_shape():
+    from tiny_turboquant import EndToEndDecodeBenchConfig, run_end_to_end_decode_benchmark
+
+    cfg = EndToEndDecodeBenchConfig(
+        prompt_lens=(16,),
+        decode_steps=2,
+        heads=1,
+        head_dim=8,
+        page_size=8,
+        device="cpu",
+        dtype="float32",
+        warmup=0,
+        repeats=1,
+        include_single_pass_loop=False,
+        tune_kernel=False,
+        tune_num_warps=False,
+    )
+    report = run_end_to_end_decode_benchmark(cfg)
+
+    assert report["version"] == "end-to-end-decode-v0.11.0"
+    assert report["rows"][0]["prompt_len"] == 16
+    assert "setup" in report["rows"][0]
+    assert "sdpa_decode" in report["rows"][0]
+    assert report["rows"][0]["split_k_decode"] is None
+
+
+def test_cli_end_to_end_decode_cpu_smoke(capsys):
+    from tiny_turboquant.cli import main
+
+    rc = main([
+        "end-to-end-decode",
+        "--device", "cpu",
+        "--dtype", "float32",
+        "--heads", "1",
+        "--head-dim", "8",
+        "--prompt-lens", "16",
+        "--decode-steps", "1",
+        "--page-size", "8",
+        "--warmup", "0",
+        "--iters", "1",
+        "--no-triton",
+        "--no-single-pass-loop",
+    ])
+    assert rc == 0
+    captured = capsys.readouterr().out
+    assert "end-to-end-decode-v0.11.0" in captured

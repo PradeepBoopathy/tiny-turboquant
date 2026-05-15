@@ -40,6 +40,11 @@ from .fused_attention import (
     split_k_markdown_report,
     save_split_k_json,
     save_split_k_markdown,
+    EndToEndDecodeBenchConfig,
+    run_end_to_end_decode_benchmark,
+    end_to_end_decode_markdown_report,
+    save_end_to_end_decode_json,
+    save_end_to_end_decode_markdown,
 )
 from .serving import (
     PagedKVCacheSpec,
@@ -206,9 +211,18 @@ __all__ = [
     "long_context_markdown_report",
     "save_long_context_json",
     "save_long_context_markdown",
+    "run_split_k_comparison",
+    "split_k_markdown_report",
+    "save_split_k_json",
+    "save_split_k_markdown",
+    "EndToEndDecodeBenchConfig",
+    "run_end_to_end_decode_benchmark",
+    "end_to_end_decode_markdown_report",
+    "save_end_to_end_decode_json",
+    "save_end_to_end_decode_markdown",
 ]
 
-__version__ = "0.10.9"
+__version__ = "0.11.0"
 
 
 def __getattr__(name: str):

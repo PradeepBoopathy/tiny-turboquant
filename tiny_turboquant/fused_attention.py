@@ -2298,3 +2298,477 @@ def save_split_k_json(report: Dict[str, Any], path: str | Path) -> None:
 
 def save_split_k_markdown(report: Dict[str, Any], path: str | Path) -> None:
     Path(path).write_text(split_k_markdown_report(report), encoding="utf-8")
+
+
+@dataclass
+class EndToEndDecodeBenchConfig:
+    """Configuration for v0.11.0 fixed-cache end-to-end decode diagnostics.
+
+    This is a synthetic decode-loop benchmark. It includes one-time compressed
+    KV layout setup, prepared payload reuse, repeated decode-token execution,
+    and amortized per-token timing. It is not a full model-serving benchmark.
+    """
+
+    batch_size: int = 1
+    heads: int = 8
+    query_len: int = 1
+    prompt_lens: Tuple[int, ...] = (16384, 32768)
+    decode_steps: int = 32
+    head_dim: int = 64
+    page_size: int = 256
+    preset: Optional[str] = "safe-layout"
+    device: str = "auto"
+    dtype: str = "auto"
+    warmup: int = 1
+    repeats: int = 3
+    seed: int = 123
+    prefer_triton: bool = True
+    kernel_block_m: int = 64
+    kernel_num_warps: int = 4
+    tune_kernel: bool = True
+    tune_block_m_values: Tuple[int, ...] = (8, 16, 32, 64, 128)
+    tune_num_warps: bool = True
+    tune_num_warps_values: Tuple[int, ...] = (1, 2, 4, 8)
+    split_k_slabs: Tuple[int, ...] = (2, 4, 8, 16)
+    cuda_graph: bool = False
+    graph_replays: int = 100
+    include_single_pass_loop: bool = True
+    competitiveness_target: str = "sdpa"
+
+    def __post_init__(self) -> None:
+        if self.query_len != 1:
+            raise ValueError("EndToEndDecodeBenchConfig is decode-only: query_len must be 1")
+        if self.preset:
+            cfg = resolve_layout_preset(self.preset)
+            # Store for report-time use through the generated fused config.
+            self._resolved_key_bits = int(cfg.get("key_bits", 8))
+            self._resolved_value_bits = int(cfg.get("value_bits", 6))
+            self._resolved_quantization_mode = str(cfg.get("quantization_mode", "affine"))
+        else:
+            self._resolved_key_bits = 8
+            self._resolved_value_bits = 6
+            self._resolved_quantization_mode = "affine"
+
+
+def _time_decode_loop(fn, *, device: str, warmup: int, repeats: int, decode_steps: int) -> Tuple[torch.Tensor, float, float]:
+    """Time a decode loop and return last output, seconds per token, total loop seconds."""
+    out = None
+    steps = max(1, int(decode_steps))
+    for _ in range(max(0, int(warmup))):
+        out = fn()
+    _sync(device)
+    t0 = time.perf_counter()
+    for _ in range(max(1, int(repeats))):
+        out = fn()
+    _sync(device)
+    total = (time.perf_counter() - t0) / max(1, int(repeats))
+    assert out is not None
+    return out, float(total / steps), float(total)
+
+
+def _build_q_steps(config: EndToEndDecodeBenchConfig, prompt_len: int, device: str, dtype: torch.dtype) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    torch.manual_seed(int(config.seed) + int(prompt_len))
+    q_steps = torch.randn(
+        int(config.decode_steps),
+        int(config.batch_size),
+        int(config.heads),
+        1,
+        int(config.head_dim),
+        device=device,
+        dtype=dtype,
+    )
+    k = torch.randn(
+        int(config.batch_size),
+        int(config.heads),
+        int(prompt_len),
+        int(config.head_dim),
+        device=device,
+        dtype=dtype,
+    )
+    v = torch.randn_like(k)
+    return q_steps, k, v
+
+
+def _select_e2e_split_k_candidate(
+    config: EndToEndDecodeBenchConfig,
+    dense_ref: torch.Tensor,
+    q0: torch.Tensor,
+    table: CompressedKVPageTable,
+    payloads: Dict[str, torch.Tensor],
+) -> Dict[str, Any]:
+    """Select the fastest quality-valid split-K candidate for the decode loop."""
+    device = str(q0.device).split(":")[0]
+    _, heads, _, head_dim = table.dense_shape
+    block_candidates = [int(x) for x in (config.tune_block_m_values if config.tune_kernel else (config.kernel_block_m,))]
+    warp_candidates = [int(x) for x in (config.tune_num_warps_values if config.tune_num_warps else (config.kernel_num_warps,))]
+    block_candidates = [x for x in block_candidates if x in (8, 16, 32, 64, 128)] or [64]
+    warp_candidates = [x for x in warp_candidates if x in (1, 2, 4, 8)] or [4]
+    slab_candidates = [max(1, int(x)) for x in config.split_k_slabs] or [16]
+
+    tuning_rows: List[Dict[str, Any]] = []
+    best: Optional[Dict[str, Any]] = None
+    q_rot = table.rotate_query(q0).contiguous()
+
+    ok, reason = _is_supported_triton_config(q0, table)
+    if not ok:
+        raise RuntimeError(reason)
+
+    for slabs in slab_candidates:
+        for block_m in block_candidates:
+            for num_warps in warp_candidates:
+                partial_m = torch.empty((slabs, heads), device=q0.device, dtype=torch.float32)
+                partial_l = torch.empty((slabs, heads), device=q0.device, dtype=torch.float32)
+                partial_acc = torch.empty((slabs, heads, head_dim), device=q0.device, dtype=torch.float32)
+                reduced = torch.empty((1, heads, 1, head_dim), device=q0.device, dtype=q0.dtype)
+                try:
+                    partials, stage1_seconds = _time_call(
+                        lambda slabs=slabs, block_m=block_m, num_warps=num_warps: _triton_split_k_stage1_partials_prepared(
+                            q_rot,
+                            payloads,
+                            table,
+                            partial_m,
+                            partial_l,
+                            partial_acc,
+                            split_k_slabs=slabs,
+                            kernel_block_m=block_m,
+                            kernel_num_warps=num_warps,
+                        ),
+                        device=device,
+                        warmup=config.warmup,
+                        repeats=config.repeats,
+                    )
+                    pm, pl, pa = partials
+                    out, stage2_seconds = _time_call(
+                        lambda: _triton_split_k_stage2_reduce_prepared(pm, pl, pa, reduced, kernel_num_warps=1),
+                        device=device,
+                        warmup=config.warmup,
+                        repeats=config.repeats,
+                    )
+                    total = float(stage1_seconds) + float(stage2_seconds)
+                    quality = attention_similarity(dense_ref, out)
+                    row = {
+                        "split_k_slabs": slabs,
+                        "kernel_block_m": block_m,
+                        "kernel_num_warps": num_warps,
+                        "stage1_seconds": float(stage1_seconds),
+                        "stage2_seconds": float(stage2_seconds),
+                        "stage1_plus_stage2_seconds": total,
+                        "relative_error": quality.get("relative_error"),
+                        "cosine_similarity": quality.get("cosine_similarity"),
+                        "candidate_quality_ok": bool(
+                            quality.get("cosine_similarity") is not None
+                            and float(quality.get("cosine_similarity")) > 0.99
+                            and quality.get("relative_error") is not None
+                            and float(quality.get("relative_error")) < 0.05
+                        ),
+                    }
+                    tuning_rows.append(row)
+                    if row["candidate_quality_ok"] and (best is None or total < float(best["stage1_plus_stage2_seconds"])):
+                        best = row
+                except Exception as exc:
+                    tuning_rows.append({
+                        "split_k_slabs": slabs,
+                        "kernel_block_m": block_m,
+                        "kernel_num_warps": num_warps,
+                        "error": repr(exc),
+                        "candidate_quality_ok": False,
+                    })
+    if best is None:
+        raise RuntimeError("no quality-valid split-K candidate completed")
+    best = dict(best)
+    best["selection_tuning_count"] = len(tuning_rows)
+    best["selection_tuning_rows"] = tuning_rows
+    return best
+
+
+def run_end_to_end_decode_benchmark(config: EndToEndDecodeBenchConfig) -> Dict[str, Any]:
+    """Run a fixed-cache repeated decode benchmark with setup/amortization reporting."""
+    requested_device = config.device
+    requested_dtype = config.dtype
+    device = _resolve_device(requested_device)
+    dtype = _resolve_dtype(requested_dtype, device)
+    warnings = _runtime_warnings(requested_device, device, requested_dtype, dtype)
+    rows: List[Dict[str, Any]] = []
+
+    for prompt_len in [int(x) for x in config.prompt_lens]:
+        try:
+            q_steps, k, v = _build_q_steps(config, prompt_len, device, dtype)
+            dtype_bytes = torch.empty((), dtype=dtype).element_size()
+            key_bits = int(getattr(config, "_resolved_key_bits", 8))
+            value_bits = int(getattr(config, "_resolved_value_bits", 6))
+            quant_mode = str(getattr(config, "_resolved_quantization_mode", "affine"))
+
+            _sync(device)
+            t0 = time.perf_counter()
+            table = CompressedKVPageTable.from_dense(
+                k,
+                v,
+                key_bits=key_bits,
+                value_bits=value_bits,
+                page_size=int(config.page_size),
+                seed=int(config.seed),
+                dtype_bytes=dtype_bytes,
+                quantization_mode=quant_mode,
+            )
+            _sync(device)
+            table_build_seconds = float(time.perf_counter() - t0)
+
+            _sync(device)
+            t0 = time.perf_counter()
+            payloads = _concat_page_payloads(table)
+            _sync(device)
+            payload_prepare_seconds = float(time.perf_counter() - t0)
+
+            first_q = q_steps[0]
+            dense_first = dense_attention(first_q, k, v)
+            memory = table.memory_report().to_dict()
+
+            selected: Optional[Dict[str, Any]] = None
+            if device == "cuda" and bool(config.prefer_triton):
+                selected = _select_e2e_split_k_candidate(config, dense_first, first_q, table, payloads)
+
+            def _dense_loop():
+                out = None
+                for i in range(int(config.decode_steps)):
+                    out = dense_attention(q_steps[i], k, v)
+                return out
+
+            def _sdpa_loop():
+                out = None
+                for i in range(int(config.decode_steps)):
+                    out = sdpa_attention(q_steps[i], k, v)
+                return out
+
+            dense_last, dense_per_token, dense_loop_total = _time_decode_loop(
+                _dense_loop,
+                device=device,
+                warmup=config.warmup,
+                repeats=config.repeats,
+                decode_steps=config.decode_steps,
+            )
+            sdpa_last, sdpa_per_token, sdpa_loop_total = _time_decode_loop(
+                _sdpa_loop,
+                device=device,
+                warmup=config.warmup,
+                repeats=config.repeats,
+                decode_steps=config.decode_steps,
+            )
+
+            single_last = None
+            single_per_token = None
+            single_loop_total = None
+            if bool(config.include_single_pass_loop):
+                def _single_loop():
+                    out = None
+                    for i in range(int(config.decode_steps)):
+                        out, _ = experimental_fused_compressed_decode_attention(
+                            q_steps[i],
+                            table,
+                            prefer_triton=config.prefer_triton,
+                            kernel_block_m=int(config.kernel_block_m),
+                            kernel_num_warps=int(config.kernel_num_warps),
+                        )
+                    return out
+
+                single_last, single_per_token, single_loop_total = _time_decode_loop(
+                    _single_loop,
+                    device=device,
+                    warmup=config.warmup,
+                    repeats=config.repeats,
+                    decode_steps=config.decode_steps,
+                )
+
+            split_last = None
+            split_per_token = None
+            split_loop_total = None
+            graph_report: Dict[str, Any] = {
+                "enabled": bool(config.cuda_graph),
+                "attempted": False,
+                "captured": False,
+                "seconds_per_token": None,
+                "reason": "CUDA Graph replay disabled",
+            }
+
+            if selected is not None:
+                slabs = int(selected["split_k_slabs"])
+                block_m = int(selected["kernel_block_m"])
+                num_warps = int(selected["kernel_num_warps"])
+                _, heads, _, head_dim = table.dense_shape
+                partial_m = torch.empty((slabs, heads), device=q_steps.device, dtype=torch.float32)
+                partial_l = torch.empty((slabs, heads), device=q_steps.device, dtype=torch.float32)
+                partial_acc = torch.empty((slabs, heads, head_dim), device=q_steps.device, dtype=torch.float32)
+                reduced = torch.empty((1, heads, 1, head_dim), device=q_steps.device, dtype=q_steps.dtype)
+
+                def _split_loop():
+                    out = None
+                    for i in range(int(config.decode_steps)):
+                        q_rot = table.rotate_query(q_steps[i]).contiguous()
+                        _triton_split_k_stage1_partials_prepared(
+                            q_rot,
+                            payloads,
+                            table,
+                            partial_m,
+                            partial_l,
+                            partial_acc,
+                            split_k_slabs=slabs,
+                            kernel_block_m=block_m,
+                            kernel_num_warps=num_warps,
+                        )
+                        out = _triton_split_k_stage2_reduce_prepared(
+                            partial_m,
+                            partial_l,
+                            partial_acc,
+                            reduced,
+                            kernel_num_warps=1,
+                        )
+                    return out
+
+                split_last, split_per_token, split_loop_total = _time_decode_loop(
+                    _split_loop,
+                    device=device,
+                    warmup=config.warmup,
+                    repeats=config.repeats,
+                    decode_steps=config.decode_steps,
+                )
+
+                if bool(config.cuda_graph):
+                    graph_out, graph_seconds, graph_meta = _time_cuda_graph_call(
+                        _split_loop,
+                        device=device,
+                        warmup=config.warmup,
+                        graph_replays=config.graph_replays,
+                    )
+                    graph_report.update(graph_meta)
+                    if graph_seconds is not None:
+                        graph_report["seconds_per_token"] = float(graph_seconds) / max(1, int(config.decode_steps))
+                        graph_report["loop_seconds"] = float(graph_seconds)
+                        if graph_out is not None:
+                            graph_report["quality_vs_dense_last"] = attention_similarity(dense_last, graph_out)
+
+            setup_seconds = table_build_seconds + payload_prepare_seconds
+            split_total_with_setup = (setup_seconds + float(split_loop_total)) if split_loop_total is not None else None
+            split_amortized = (split_total_with_setup / max(1, int(config.decode_steps))) if split_total_with_setup is not None else None
+            split_first_token_with_setup = (setup_seconds + float(split_per_token)) if split_per_token is not None else None
+
+            row = {
+                "prompt_len": int(prompt_len),
+                "decode_steps": int(config.decode_steps),
+                "preset": config.preset,
+                "quantization_mode": table.quantization_mode,
+                "key_bits": key_bits,
+                "value_bits": value_bits,
+                "page_size": int(config.page_size),
+                "page_count": int(table.page_count),
+                "memory": memory,
+                "setup": {
+                    "table_build_seconds": table_build_seconds,
+                    "payload_prepare_seconds": payload_prepare_seconds,
+                    "total_setup_seconds": setup_seconds,
+                    "prepared_payloads_reused": True,
+                    "output_buffers_reused": bool(selected is not None),
+                },
+                "dense_decode": {
+                    "loop_seconds": dense_loop_total,
+                    "seconds_per_token": dense_per_token,
+                    "tokens_per_second": _safe_ratio(1.0, dense_per_token),
+                },
+                "sdpa_decode": {
+                    "loop_seconds": sdpa_loop_total,
+                    "seconds_per_token": sdpa_per_token,
+                    "tokens_per_second": _safe_ratio(1.0, sdpa_per_token),
+                    "quality_vs_dense_last": attention_similarity(dense_last, sdpa_last),
+                },
+                "single_pass_decode": None if single_per_token is None else {
+                    "loop_seconds": single_loop_total,
+                    "seconds_per_token": single_per_token,
+                    "tokens_per_second": _safe_ratio(1.0, single_per_token),
+                    "over_sdpa_per_token": _safe_ratio(single_per_token, sdpa_per_token),
+                    "quality_vs_dense_last": attention_similarity(dense_last, single_last) if single_last is not None else None,
+                },
+                "split_k_decode": None if split_per_token is None else {
+                    "selected": selected,
+                    "loop_seconds": split_loop_total,
+                    "seconds_per_token": split_per_token,
+                    "tokens_per_second": _safe_ratio(1.0, split_per_token),
+                    "over_sdpa_per_token": _safe_ratio(split_per_token, sdpa_per_token),
+                    "speedup_vs_sdpa_per_token": _safe_ratio(sdpa_per_token, split_per_token),
+                    "speedup_vs_single_pass_per_token": _safe_ratio(single_per_token, split_per_token) if single_per_token is not None else None,
+                    "total_with_setup_seconds": split_total_with_setup,
+                    "amortized_seconds_per_token_with_setup": split_amortized,
+                    "first_token_seconds_with_setup": split_first_token_with_setup,
+                    "amortized_over_sdpa_per_token": _safe_ratio(split_amortized, sdpa_per_token) if split_amortized is not None else None,
+                    "first_token_over_sdpa_per_token": _safe_ratio(split_first_token_with_setup, sdpa_per_token) if split_first_token_with_setup is not None else None,
+                    "quality_vs_dense_last": attention_similarity(dense_last, split_last) if split_last is not None else None,
+                    "kernel_loop_beats_sdpa": bool(split_per_token is not None and split_per_token <= sdpa_per_token),
+                    "amortized_with_setup_beats_sdpa": bool(split_amortized is not None and split_amortized <= sdpa_per_token),
+                },
+                "cuda_graph_decode": graph_report,
+                "boundary": "Fixed-cache synthetic decode-loop benchmark; not a full model serving benchmark.",
+            }
+            rows.append(row)
+        except Exception as exc:
+            warnings.append(f"prompt_len={prompt_len} failed: {exc!r}")
+            rows.append({"prompt_len": int(prompt_len), "error": repr(exc), "preset": config.preset})
+
+    any_kernel_sdpa = any(
+        bool(r.get("split_k_decode", {}) and r["split_k_decode"].get("kernel_loop_beats_sdpa"))
+        for r in rows if "error" not in r
+    )
+    any_amortized_sdpa = any(
+        bool(r.get("split_k_decode", {}) and r["split_k_decode"].get("amortized_with_setup_beats_sdpa"))
+        for r in rows if "error" not in r
+    )
+
+    return {
+        "version": "end-to-end-decode-v0.11.0",
+        "config": asdict(config),
+        "warnings": warnings,
+        "rows": rows,
+        "summary": {
+            "kernel_loop_verdict": "split-k-decode-loop-beats-sdpa-in-at-least-one-case" if any_kernel_sdpa else "split-k-decode-loop-not-competitive-yet",
+            "amortized_with_setup_verdict": "split-k-amortized-with-setup-beats-sdpa-in-at-least-one-case" if any_amortized_sdpa else "split-k-setup-cost-still-needs-amortization",
+            "measured_kernel_verdict": "v0.11.0 measures repeated decode steps with prepared payload reuse, setup accounting, and amortized per-token reporting",
+            "boundary": "This is a fixed-cache synthetic decode-loop diagnostic, not production LLM serving acceleration.",
+        },
+        "interpretation": (
+            "v0.11.0 moves beyond one-shot kernel timing by reporting setup cost, repeated decode-loop timing, "
+            "amortized per-token timing, and SDPA comparison. Prepared compressed payloads and output buffers are reused, "
+            "but this is still not a full model-serving benchmark."
+        ),
+    }
+
+
+def end_to_end_decode_markdown_report(report: Dict[str, Any]) -> str:
+    lines = [
+        "# tiny-turboquant v0.11.0 end-to-end decode diagnostic",
+        "",
+        "This report measures fixed-cache repeated decode-loop behavior with setup accounting. It is not a full model-serving benchmark.",
+        "",
+        "## Summary",
+        f"- {report.get('summary')}",
+        "",
+        "## Rows",
+    ]
+    for row in report.get("rows", []):
+        if "error" in row:
+            lines.append(f"- prompt_len={row.get('prompt_len')}: ERROR {row.get('error')}")
+            continue
+        split = row.get("split_k_decode") or {}
+        sdpa = row.get("sdpa_decode") or {}
+        setup = row.get("setup") or {}
+        lines.append(
+            f"- prompt_len={row.get('prompt_len')}, decode_steps={row.get('decode_steps')}, "
+            f"setup={setup.get('total_setup_seconds')}, sdpa/token={sdpa.get('seconds_per_token')}, "
+            f"split_k/token={split.get('seconds_per_token')}, split_k_over_sdpa={split.get('over_sdpa_per_token')}, "
+            f"amortized_over_sdpa={split.get('amortized_over_sdpa_per_token')}, cos={((split.get('quality_vs_dense_last') or {}).get('cosine_similarity'))}"
+        )
+    lines.extend(["", "## Boundary", "This is not a production acceleration claim."])
+    return "\n".join(lines) + "\n"
+
+
+def save_end_to_end_decode_json(report: Dict[str, Any], path: str | Path) -> None:
+    Path(path).write_text(json.dumps(report, indent=2), encoding="utf-8")
+
+
+def save_end_to_end_decode_markdown(report: Dict[str, Any], path: str | Path) -> None:
+    Path(path).write_text(end_to_end_decode_markdown_report(report), encoding="utf-8")
