@@ -1,11 +1,11 @@
 """Experimental fused compressed decode-attention research utilities.
 
-v0.10.7 extends the Triton fused compressed decode-attention prototype with
+v0.10.8 extends the Triton fused compressed decode-attention prototype with
 CUDA Graph replay diagnostics on top of page-size/BLOCK_M sweep support for the affine safe-layout path.  The supported fast path remains intentionally narrow:
 query_len=1, batch_size=1, key_bits=8, affine per-page/per-channel K, and
 value_bits in {4, 6, 8}.  Unsupported configurations fall back to the
 quality-safe PyTorch compressed-page reference path and label that mode
-explicitly.  v0.10.7 reports normal fused timing, optional CUDA Graph replay timing, kernel block size, optional page-size sweep results, and speed/quality gaps
+explicitly.  v0.10.8 reports normal fused timing, optional CUDA Graph replay timing, kernel block size, optional page-size sweep results, and speed/quality gaps
 against dense attention, SDPA, and the Python compressed-page reference path.
 
 This module does not claim production inference acceleration.
@@ -200,7 +200,7 @@ if triton is not None and tl is not None:  # pragma: no cover - requires CUDA+Tr
         BLOCK_D: tl.constexpr,
         SCALE: tl.constexpr,
     ):
-        # One program computes one head for batch=1/query_len=1.  v0.10.7
+        # One program computes one head for batch=1/query_len=1.  v0.10.8
         # extends the narrow Triton prototype to residual-affine pages and
         # low-bit K as well as V.  This is still an experimental microkernel,
         # not a general serving kernel.
@@ -354,7 +354,7 @@ if triton is not None and tl is not None:  # pragma: no cover - requires CUDA+Tr
         BLOCK_D: tl.constexpr,
         SCALE: tl.constexpr,
     ):
-        # v0.10.7 measured split-K Stage-1 partial kernel.  Each program
+        # v0.10.8 measured split-K Stage-1 partial kernel.  Each program
         # computes slab-local online-softmax statistics for one head and one
         # sequence slab.  Stage 2 reduction remains a Torch reference path in
         # this release.
@@ -497,7 +497,7 @@ if triton is not None and tl is not None:  # pragma: no cover - requires CUDA+Tr
         SLABS: tl.constexpr,
         BLOCK_D: tl.constexpr,
     ):
-        # v0.10.7 Triton Stage-2 reducer.  One program reduces all split-K
+        # v0.10.8 Triton Stage-2 reducer.  One program reduces all split-K
         # slab partials for one head.  The Stage-1 contract is:
         # partial_acc = sum(exp(score - local_max) * V), i.e. unnormalized.
         h = tl.program_id(0)
@@ -537,19 +537,19 @@ def _is_supported_triton_config(query: torch.Tensor, page_table: CompressedKVPag
     if not query.is_cuda:
         return False, "query is not on CUDA"
     if query.ndim != 4 or query.shape[0] != 1 or query.shape[2] != 1:
-        return False, "v0.10.7 Triton prototype supports batch=1 and query_len=1 only"
+        return False, "v0.10.8 Triton prototype supports batch=1 and query_len=1 only"
     if page_table.quantization_mode not in {"affine", "residual-affine"}:
-        return False, "v0.10.7 Triton prototype supports affine and residual-affine layouts only"
+        return False, "v0.10.8 Triton prototype supports affine and residual-affine layouts only"
     if page_table.page_count <= 0:
         return False, "page table is empty"
     if page_table.dense_shape[0] != 1:
-        return False, "v0.10.7 Triton prototype supports batch=1 page tables only"
+        return False, "v0.10.8 Triton prototype supports batch=1 page tables only"
     if page_table.head_dim not in (32, 64, 128):
-        return False, "v0.10.7 Triton prototype supports head_dim in {32,64,128}"
+        return False, "v0.10.8 Triton prototype supports head_dim in {32,64,128}"
     if any(p.key_bits not in (4, 6, 8) for p in page_table.pages):
-        return False, "v0.10.7 Triton prototype supports key_bits in {4,6,8}"
+        return False, "v0.10.8 Triton prototype supports key_bits in {4,6,8}"
     if any(p.value_bits not in (4, 6, 8) for p in page_table.pages):
-        return False, "v0.10.7 Triton prototype supports value_bits in {4,6,8}"
+        return False, "v0.10.8 Triton prototype supports value_bits in {4,6,8}"
     if len({p.key_bits for p in page_table.pages}) != 1:
         return False, "all pages must use the same key_bits"
     if len({p.value_bits for p in page_table.pages}) != 1:
@@ -557,7 +557,7 @@ def _is_supported_triton_config(query: torch.Tensor, page_table: CompressedKVPag
     if len({p.page_length for p in page_table.pages}) != 1:
         return False, "all pages must have the same page length"
     if page_table.pages[0].page_length != page_table.page_size:
-        return False, "v0.10.7 Triton prototype requires full pages; pad or use divisible seq_len"
+        return False, "v0.10.8 Triton prototype requires full pages; pad or use divisible seq_len"
     if page_table.quantization_mode == "residual-affine":
         if any(p.key_residual_packed is None or p.value_residual_packed is None for p in page_table.pages):
             return False, "residual-affine pages must include residual sign payloads"
@@ -610,9 +610,9 @@ def _triton_fused_affine_decode_attention(
     if not ok:
         raise RuntimeError(reason)
     if int(kernel_block_m) not in (8, 16, 32, 64, 128):
-        raise RuntimeError("v0.10.7 Triton prototype supports kernel_block_m in {8,16,32,64,128}")
+        raise RuntimeError("v0.10.8 Triton prototype supports kernel_block_m in {8,16,32,64,128}")
     if int(kernel_num_warps) not in (1, 2, 4, 8):
-        raise RuntimeError("v0.10.7 Triton prototype supports kernel_num_warps in {1,2,4,8}")
+        raise RuntimeError("v0.10.8 Triton prototype supports kernel_num_warps in {1,2,4,8}")
     q_rot = page_table.rotate_query(query).contiguous()
     payloads = _concat_page_payloads(page_table)
     b, h, s, d = page_table.dense_shape
@@ -622,7 +622,7 @@ def _triton_fused_affine_decode_attention(
     value_bits = int(page_table.pages[0].value_bits)
     has_residual = page_table.quantization_mode == "residual-affine"
     out = torch.empty((1, h, 1, d), device=query.device, dtype=query.dtype)
-    # v0.10.7 exposes BLOCK_M so users can tune page-loop granularity.
+    # v0.10.8 exposes BLOCK_M so users can tune page-loop granularity.
     block_d = 1 << ((d - 1).bit_length())
     block_m = int(kernel_block_m)
     _ttq_affine_decode_kernel[(h,)](
@@ -661,7 +661,7 @@ def triton_split_k_stage1_partials(
     kernel_block_m: int = 64,
     kernel_num_warps: int = 4,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Dict[str, Any]]:
-    """Run the v0.10.7 Triton Stage-1 split-K partial-statistics kernel.
+    """Run the v0.10.8 Triton Stage-1 split-K partial-statistics kernel.
 
     Returns ``(partial_m, partial_l, partial_acc, metadata)`` where:
     - partial_m is shaped ``(slabs, heads)``
@@ -669,17 +669,17 @@ def triton_split_k_stage1_partials(
     - partial_acc is shaped ``(slabs, heads, head_dim)``
 
     This is only Stage 1. Stage 2 reduction is intentionally a separate
-    reference step in v0.10.7.
+    reference step in v0.10.8.
     """
     ok, reason = _is_supported_triton_config(query, page_table)
     if not ok:
         raise RuntimeError(reason)
     if triton is None or tl is None or _ttq_split_k_stage1_kernel is None:
-        raise RuntimeError("v0.10.7 Triton split-K Stage-1 kernel is unavailable")
+        raise RuntimeError("v0.10.8 Triton split-K Stage-1 kernel is unavailable")
     if int(kernel_block_m) not in (8, 16, 32, 64, 128):
-        raise RuntimeError("v0.10.7 Triton split-K Stage-1 supports kernel_block_m in {8,16,32,64,128}")
+        raise RuntimeError("v0.10.8 Triton split-K Stage-1 supports kernel_block_m in {8,16,32,64,128}")
     if int(kernel_num_warps) not in (1, 2, 4, 8):
-        raise RuntimeError("v0.10.7 Triton split-K Stage-1 supports kernel_num_warps in {1,2,4,8}")
+        raise RuntimeError("v0.10.8 Triton split-K Stage-1 supports kernel_num_warps in {1,2,4,8}")
     slabs = max(1, int(split_k_slabs))
     q_rot = page_table.rotate_query(query).contiguous()
     payloads = _concat_page_payloads(page_table)
@@ -743,16 +743,16 @@ def triton_split_k_stage2_reduce(
     output_dtype: Optional[torch.dtype] = None,
     kernel_num_warps: int = 1,
 ) -> Tuple[torch.Tensor, Dict[str, Any]]:
-    """Run the v0.10.7 Triton Stage-2 split-K reducer.
+    """Run the v0.10.8 Triton Stage-2 split-K reducer.
 
     Stage 1 must provide unnormalized accumulators:
     ``partial_acc = sum(exp(score - local_max) * V)``.  The reducer combines
     the slab-local statistics with log-sum-exp correction entirely in Triton.
     """
     if triton is None or tl is None or _ttq_split_k_stage2_reduce_kernel is None:
-        raise RuntimeError("v0.10.7 Triton split-K Stage-2 reducer is unavailable")
+        raise RuntimeError("v0.10.8 Triton split-K Stage-2 reducer is unavailable")
     if not partial_m.is_cuda or not partial_l.is_cuda or not partial_acc.is_cuda:
-        raise RuntimeError("v0.10.7 Triton split-K Stage-2 reducer requires CUDA tensors")
+        raise RuntimeError("v0.10.8 Triton split-K Stage-2 reducer requires CUDA tensors")
     if partial_m.ndim != 2 or partial_l.ndim != 2 or partial_acc.ndim != 3:
         raise ValueError("partial_m/partial_l/partial_acc must be shaped (slabs, heads), (slabs, heads), (slabs, heads, head_dim)")
     slabs, heads = partial_m.shape
@@ -760,9 +760,9 @@ def triton_split_k_stage2_reduce(
         raise ValueError("split-K partial tensor shapes do not agree")
     d = int(partial_acc.shape[-1])
     if d not in (32, 64, 128):
-        raise RuntimeError("v0.10.7 Triton Stage-2 reducer supports head_dim in {32,64,128}")
+        raise RuntimeError("v0.10.8 Triton Stage-2 reducer supports head_dim in {32,64,128}")
     if int(kernel_num_warps) not in (1, 2, 4, 8):
-        raise RuntimeError("v0.10.7 Triton Stage-2 reducer supports kernel_num_warps in {1,2,4,8}")
+        raise RuntimeError("v0.10.8 Triton Stage-2 reducer supports kernel_num_warps in {1,2,4,8}")
     dtype = output_dtype or partial_acc.dtype
     out = torch.empty((1, heads, 1, d), device=partial_acc.device, dtype=dtype)
     block_d = 1 << ((d - 1).bit_length())
@@ -799,7 +799,7 @@ def triton_split_k_full_attention_reference(
 ) -> Tuple[torch.Tensor, Dict[str, Any]]:
     """Run real Triton Stage 1 plus real Triton Stage 2 reducer.
 
-    This is the v0.10.7 measured full split-K research path.  It is still a
+    This is the v0.10.8 measured full split-K research path.  It is still a
     microbenchmark prototype, not a production serving kernel.
     """
     pm, pl, pa, meta1 = triton_split_k_stage1_partials(
@@ -830,7 +830,7 @@ def triton_split_k_full_attention_reference(
 def reduce_split_k_partials(partial_m: torch.Tensor, partial_l: torch.Tensor, partial_acc: torch.Tensor, *, output_dtype: Optional[torch.dtype] = None) -> torch.Tensor:
     """Reference Stage-2 log-sum-exp reduction for Stage-1 split-K partials.
 
-    Contract fixed in v0.10.7:
+    Contract fixed in v0.10.8:
     ``partial_acc`` must be the **unnormalized** slab accumulator
     ``sum(exp(score - local_max) * V)``.  Therefore the global reducer must
     scale ``partial_acc`` only by ``exp(local_max - global_max)``.  It must not
@@ -878,7 +878,7 @@ def experimental_fused_compressed_decode_attention(
     kernel_block_m: int = 64,
     kernel_num_warps: int = 4,
 ) -> Tuple[torch.Tensor, Dict[str, Any]]:
-    """Run the v0.10.7 experimental compressed decode-attention path.
+    """Run the v0.10.8 experimental compressed decode-attention path.
 
     The function consumes the compressed page table directly and avoids full
     dense K/V reconstruction.  When the narrow Triton prototype supports the
@@ -903,7 +903,7 @@ def experimental_fused_compressed_decode_attention(
                 "mode": ("triton-fused-residual-affine-decode" if page_table.quantization_mode == "residual-affine" else "triton-fused-affine-decode"),
                 "triton_attempted": True,
                 "triton_runtime": runtime,
-                "reason": ("minimal v0.10.7 Triton fused residual-affine decode kernel executed" if page_table.quantization_mode == "residual-affine" else "minimal v0.10.7 Triton fused affine decode kernel executed"),
+                "reason": ("minimal v0.10.8 Triton fused residual-affine decode kernel executed" if page_table.quantization_mode == "residual-affine" else "minimal v0.10.8 Triton fused affine decode kernel executed"),
                 "support_check": support_reason,
                 "query_len": int(query.shape[2]),
                 "kernel_block_m": int(kernel_block_m),
@@ -1146,7 +1146,7 @@ def _run_fused_decode_benchmark_core(config: FusedDecodeBenchConfig) -> Dict[str
         warnings = list(warnings) + [warning]
 
     return {
-        "version": "0.10.7",
+        "version": "0.10.8",
         "benchmark": "experimental-fused-compressed-decode-attention",
         "config": {
             **asdict(config),
@@ -1169,7 +1169,7 @@ def _run_fused_decode_benchmark_core(config: FusedDecodeBenchConfig) -> Dict[str
             "selected_kernel_block_m": int(selected_block_m),
             "selected_kernel_num_warps": int(selected_num_warps),
             "kernel_tuning": tuning_rows,
-            "kernel_algorithm_note": "v0.10.7 tunes BLOCK_M and Triton num_warps for the safe-layout/residual microkernel; it does not add split-K or production serving integration.",
+            "kernel_algorithm_note": "v0.10.8 tunes BLOCK_M and Triton num_warps for the safe-layout/residual microkernel; it does not add split-K or production serving integration.",
             "speedup_vs_compressed_page_reference": _safe_ratio(reference_seconds, fused_seconds),
             "speedup_vs_dense_manual": _safe_ratio(dense_seconds, fused_seconds),
             "speedup_vs_sdpa": (
@@ -1181,7 +1181,7 @@ def _run_fused_decode_benchmark_core(config: FusedDecodeBenchConfig) -> Dict[str
             "graph_fused_seconds": graph_report.get("seconds"),
             "graph_speedup_vs_normal_fused": graph_report.get("speedup_vs_normal_fused"),
             "note": (
-                "Timing is diagnostic. v0.10.7 adds CUDA Graph replay diagnostics around the minimal fused-attention prototype; "
+                "Timing is diagnostic. v0.10.8 adds CUDA Graph replay diagnostics around the minimal fused-attention prototype; "
                 "production acceleration is not claimed."
             ),
         },
@@ -1192,7 +1192,7 @@ def _run_fused_decode_benchmark_core(config: FusedDecodeBenchConfig) -> Dict[str
             "quality_warning": warning,
         },
         "interpretation": (
-            "v0.10.7 benchmarks an experimental compressed decode-attention path over the compressed page layout with optional BLOCK_M/page-size tuning and CUDA Graph replay diagnostics. "
+            "v0.10.8 benchmarks an experimental compressed decode-attention path over the compressed page layout with optional BLOCK_M/page-size tuning and CUDA Graph replay diagnostics. "
             "It reads compressed pages without constructing full dense K/V. When a production Triton kernel is not "
             "available, the benchmark uses the verified PyTorch compressed-page fallback and reports that mode explicitly."
         ),
@@ -1277,7 +1277,7 @@ def _add_competitiveness_summary(report: Dict[str, Any]) -> Dict[str, Any]:
 def run_fused_decode_benchmark(config: FusedDecodeBenchConfig) -> Dict[str, Any]:
     """Benchmark dense, SDPA, compressed-page reference, and v0.9 fused path.
 
-    v0.10.7 can optionally sweep page sizes in addition to BLOCK_M.  The returned
+    v0.10.8 can optionally sweep page sizes in addition to BLOCK_M.  The returned
     report is always the fastest fused candidate, with all candidates recorded
     under ``page_size_tuning`` when page-size tuning is enabled.
     """
@@ -1310,14 +1310,14 @@ def run_fused_decode_benchmark(config: FusedDecodeBenchConfig) -> Dict[str, Any]
         })
 
     best = min(reports, key=lambda r: float(r.get("timing", {}).get("effective_fused_seconds") or r.get("timing", {}).get("experimental_fused_seconds") or 1e30))
-    best["version"] = "0.10.7"
+    best["version"] = "0.10.8"
     best["page_size_tuning"] = rows
     best["execution"]["selected_page_size"] = int(best.get("config", {}).get("page_size", config.page_size))
     best["execution"]["tune_page_size"] = True
     best["timing"]["selected_page_size"] = int(best.get("config", {}).get("page_size", config.page_size))
     best["timing"]["page_size_tuning"] = rows
     best["interpretation"] = (
-        "v0.10.7 benchmarks an experimental compressed decode-attention path over the compressed page layout with optional "
+        "v0.10.8 benchmarks an experimental compressed decode-attention path over the compressed page layout with optional "
         "BLOCK_M, page-size tuning, and CUDA Graph replay diagnostics. It reads compressed pages without constructing full dense K/V. The competitiveness "
         "verdict is a microbenchmark diagnostic and is not a production acceleration claim."
     )
@@ -1329,7 +1329,7 @@ def fused_decode_markdown_report(report: Dict[str, Any]) -> str:
     quality = report["quality"]
     execution = report.get("execution", {})
     lines = [
-        "# tiny-turboquant v0.10.7 fused decode-attention benchmark",
+        "# tiny-turboquant v0.10.8 fused decode-attention benchmark",
         "",
         "## Execution",
         f"- Mode: {execution.get('mode')}",
@@ -1382,7 +1382,7 @@ def save_fused_decode_markdown(report: Dict[str, Any], path: str | Path) -> None
 class LongContextCompareConfig:
     """Compare compressed decode-attention layouts across longer contexts.
 
-    v0.10.7 is a diagnostic layer over ``run_fused_decode_benchmark``.  It is
+    v0.10.8 is a diagnostic layer over ``run_fused_decode_benchmark``.  It is
     meant to answer one question: does a more compressed residual layout become
     worthwhile as context length grows?  The benchmark is still synthetic and
     microbenchmark-oriented; it is not a production serving benchmark.
@@ -1568,13 +1568,13 @@ def run_long_context_comparison(config: LongContextCompareConfig) -> Dict[str, A
                 })
 
     return {
-        "version": "long-context-comparison-v0.10.7",
+        "version": "long-context-comparison-v0.10.8",
         "config": asdict(config),
         "warnings": warnings,
         "rows": rows,
         "summary": _summarize_long_context_rows([r for r in rows if "error" not in r]),
         "interpretation": (
-            "v0.10.7 compares safe-layout and residual layouts across longer context lengths to find where "
+            "v0.10.8 compares safe-layout and residual layouts across longer context lengths to find where "
             "extra residual correction overhead becomes worthwhile. It reuses the experimental fused decode benchmark, "
             "including CUDA Graph replay when enabled. This is not a production serving benchmark and does not claim production inference acceleration."
         ),
@@ -1583,7 +1583,7 @@ def run_long_context_comparison(config: LongContextCompareConfig) -> Dict[str, A
 
 def long_context_markdown_report(report: Dict[str, Any]) -> str:
     lines = [
-        "# tiny-turboquant v0.10.7 long-context comparison",
+        "# tiny-turboquant v0.10.8 long-context comparison",
         "",
         "## Boundary",
         "This is a synthetic microbenchmark diagnostic. It does not claim production inference acceleration.",
@@ -1626,7 +1626,7 @@ def save_long_context_markdown(report: Dict[str, Any], path: str | Path) -> None
 class SplitKCompareConfig:
     """Diagnostic split-K / sequence-parallel planning benchmark.
 
-    v0.10.7 does not replace the single-pass Triton kernel with a production
+    v0.10.8 does not replace the single-pass Triton kernel with a production
     FlashDecoding implementation.  Instead it measures the current best fused
     safe-layout path and estimates how much sequence-parallel split-K would need
     to improve to beat SDPA.  This keeps the report honest while giving concrete
@@ -1873,7 +1873,16 @@ def _measure_triton_full_split_k_rows(
     base_row: Dict[str, Any],
     slabs: Tuple[int, ...],
 ) -> List[Dict[str, Any]]:
-    """Measure real Triton Stage-1 plus real Triton Stage-2 reduction."""
+    """Measure real Triton Stage-1 plus real Triton Stage-2 reduction.
+
+    v0.10.8 optimizes the measured full split-K path by tuning the Stage-1
+    launch shape separately from the single-pass fused kernel.  Earlier
+    versions reused ``config.kernel_block_m`` and ``config.kernel_num_warps``
+    for Stage 1, which was a poor proxy because split-K has a different work
+    shape.  This function now searches ``BLOCK_M × num_warps`` when tuning is
+    enabled, measures Stage 1 and Stage 2 together for each candidate, and
+    selects the fastest quality-valid full split-K row.
+    """
     rows: List[Dict[str, Any]] = []
     device = str(q.device).split(":")[0]
     sdpa = base_row.get("sdpa_seconds")
@@ -1882,56 +1891,103 @@ def _measure_triton_full_split_k_rows(
     dense_f = float(dense) if dense is not None else None
     single = base_row.get("effective_fused_seconds")
     single_f = float(single) if single is not None else None
+    block_candidates = _candidate_block_values(config)
+    warp_candidates = _candidate_warp_values(config)
+
     for n in slabs:
         n = max(1, int(n))
+        candidate_rows: List[Dict[str, Any]] = []
+        best: Optional[Dict[str, Any]] = None
         try:
-            # Time Stage 1 and Stage 2 separately to expose where overhead lives.
-            partials, stage1_seconds = _time_call(
-                lambda n=n: triton_split_k_stage1_partials(
-                    q,
-                    table,
-                    split_k_slabs=n,
-                    kernel_block_m=config.kernel_block_m,
-                    kernel_num_warps=config.kernel_num_warps,
-                )[:3],
-                device=device,
-                warmup=config.warmup,
-                repeats=config.repeats,
-            )
-            partial_m, partial_l, partial_acc = partials
-            reduced_out, stage2_seconds = _time_call(
-                lambda: triton_split_k_stage2_reduce(
-                    partial_m,
-                    partial_l,
-                    partial_acc,
-                    output_dtype=q.dtype,
-                    kernel_num_warps=1,
-                )[0],
-                device=device,
-                warmup=config.warmup,
-                repeats=config.repeats,
-            )
-            total_seconds = float(stage1_seconds) + float(stage2_seconds)
-            quality = attention_similarity(dense_out, reduced_out)
+            for block_m in block_candidates:
+                for num_warps in warp_candidates:
+                    try:
+                        partials, stage1_seconds = _time_call(
+                            lambda n=n, block_m=block_m, num_warps=num_warps: triton_split_k_stage1_partials(
+                                q,
+                                table,
+                                split_k_slabs=n,
+                                kernel_block_m=int(block_m),
+                                kernel_num_warps=int(num_warps),
+                            )[:3],
+                            device=device,
+                            warmup=config.warmup,
+                            repeats=config.repeats,
+                        )
+                        partial_m, partial_l, partial_acc = partials
+                        reduced_out, stage2_seconds = _time_call(
+                            lambda: triton_split_k_stage2_reduce(
+                                partial_m,
+                                partial_l,
+                                partial_acc,
+                                output_dtype=q.dtype,
+                                kernel_num_warps=1,
+                            )[0],
+                            device=device,
+                            warmup=config.warmup,
+                            repeats=config.repeats,
+                        )
+                        total_seconds = float(stage1_seconds) + float(stage2_seconds)
+                        quality = attention_similarity(dense_out, reduced_out)
+                        candidate = {
+                            "split_k_slabs": n,
+                            "kernel_block_m": int(block_m),
+                            "kernel_num_warps": int(num_warps),
+                            "stage1_seconds": float(stage1_seconds),
+                            "stage2_seconds": float(stage2_seconds),
+                            "stage1_plus_stage2_seconds": total_seconds,
+                            "relative_error": quality.get("relative_error"),
+                            "cosine_similarity": quality.get("cosine_similarity"),
+                            "candidate_quality_ok": bool(
+                                quality.get("cosine_similarity") is not None
+                                and float(quality.get("cosine_similarity")) > 0.99
+                                and quality.get("relative_error") is not None
+                                and float(quality.get("relative_error")) < 0.05
+                            ),
+                        }
+                        candidate_rows.append(candidate)
+                        if best is None or total_seconds < float(best["stage1_plus_stage2_seconds"]):
+                            best = candidate
+                    except Exception as exc:
+                        candidate_rows.append({
+                            "split_k_slabs": n,
+                            "kernel_block_m": int(block_m),
+                            "kernel_num_warps": int(num_warps),
+                            "error": repr(exc),
+                            "candidate_quality_ok": False,
+                        })
+
+            if best is None:
+                raise RuntimeError("no full Triton split-K candidate completed")
+
+            total_seconds = float(best["stage1_plus_stage2_seconds"])
             rows.append({
                 "split_k_slabs": n,
-                "stage1_seconds": float(stage1_seconds),
-                "stage2_seconds": float(stage2_seconds),
+                "selected_kernel_block_m": int(best["kernel_block_m"]),
+                "selected_kernel_num_warps": int(best["kernel_num_warps"]),
+                "stage1_seconds": float(best["stage1_seconds"]),
+                "stage2_seconds": float(best["stage2_seconds"]),
                 "stage1_plus_stage2_seconds": total_seconds,
                 "full_speedup_vs_single_pass": (single_f / total_seconds) if single_f and total_seconds > 0 else None,
                 "full_over_sdpa": (total_seconds / sdpa_f) if sdpa_f and sdpa_f > 0 else None,
                 "full_over_dense": (total_seconds / dense_f) if dense_f and dense_f > 0 else None,
                 "full_faster_than_sdpa": bool(sdpa_f and total_seconds <= sdpa_f),
-                "relative_error": quality.get("relative_error"),
-                "cosine_similarity": quality.get("cosine_similarity"),
-                "mode": "triton-two-stage-split-k",
-                "measurement_note": "Stage 1 and Stage 2 are real Triton kernels; this is still a research microbenchmark, not production FlashDecoding.",
+                "relative_error": best.get("relative_error"),
+                "cosine_similarity": best.get("cosine_similarity"),
+                "stage1_kernel_tuning": candidate_rows,
+                "stage1_kernel_tuning_count": len(candidate_rows),
+                "mode": "triton-two-stage-split-k-optimized-stage1",
+                "measurement_note": (
+                    "Stage 1 and Stage 2 are real Triton kernels. v0.10.8 tunes Stage-1 "
+                    "BLOCK_M × num_warps per slab count; this remains a research microbenchmark, "
+                    "not production FlashDecoding."
+                ),
             })
         except Exception as exc:
             rows.append({
                 "split_k_slabs": n,
                 "error": repr(exc),
-                "mode": "triton-two-stage-split-k",
+                "mode": "triton-two-stage-split-k-optimized-stage1",
                 "measurement_note": "Full Triton two-stage split-K failed or was unsupported",
             })
     return rows
@@ -2065,7 +2121,7 @@ def run_split_k_comparison(config: SplitKCompareConfig) -> Dict[str, Any]:
         if "stage1_plus_stage2_seconds" in p
     ]
     return {
-        "version": "split-k-comparison-v0.10.7",
+        "version": "split-k-comparison-v0.10.8",
         "config": asdict(config),
         "warnings": warnings,
         "rows": rows,
@@ -2074,11 +2130,11 @@ def run_split_k_comparison(config: SplitKCompareConfig) -> Dict[str, Any]:
             "global_measured_verdict": "measured-split-k-beats-sdpa" if any_measured_sdpa else "measured-split-k-not-competitive-yet" if measured_rows else "measured-split-k-not-run",
             "global_triton_stage1_verdict": "triton-stage1-beats-sdpa-in-at-least-one-case" if any_stage1_sdpa else "triton-stage1-measured",
             "global_triton_full_split_k_verdict": "triton-full-split-k-beats-sdpa-in-at-least-one-case" if any_full_sdpa else "triton-full-split-k-not-competitive-yet" if full_rows else "triton-full-split-k-unavailable",
-            "measured_kernel_verdict": "v0.10.7 adds a real Triton split-K Stage-2 reducer and reports full Stage-1 + Stage-2 measured split-K rows",
+            "measured_kernel_verdict": "v0.10.8 tunes the full Triton split-K Stage-1 launch shape and reports optimized Stage-1 + Stage-2 measured rows",
             "boundary": "This is a split-K measured research diagnostic, not production inference acceleration.",
         },
         "interpretation": (
-            "v0.10.7 measures real Triton Stage-1 partial statistics plus a real Triton Stage-2 reducer over compressed pages. "
+            "v0.10.8 measures real Triton Stage-1 partial statistics plus a real Triton Stage-2 reducer over compressed pages. "
             "This completes the measured two-stage split-K research path, but it is still not a production FlashDecoding serving kernel."
         ),
     }
@@ -2086,9 +2142,9 @@ def run_split_k_comparison(config: SplitKCompareConfig) -> Dict[str, Any]:
 
 def split_k_markdown_report(report: Dict[str, Any]) -> str:
     lines = [
-        "# tiny-turboquant v0.10.7 split-K planning diagnostic",
+        "# tiny-turboquant v0.10.8 optimized split-K diagnostic",
         "",
-        "This report is a planning diagnostic. Split-K rows are projections, not measured production kernels.",
+        "This report includes measured full Triton split-K research rows with Stage-1 launch-shape tuning. It is still not a production FlashDecoding benchmark.",
         "",
         "## Summary",
         f"- {report.get('summary')}",

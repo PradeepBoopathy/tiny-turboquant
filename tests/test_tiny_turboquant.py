@@ -959,7 +959,7 @@ def test_v090_fused_decode_benchmark_and_cli(capsys):
         prefer_triton=False,
     )
     report = run_fused_decode_benchmark(cfg)
-    assert report["version"] == "0.10.7"
+    assert report["version"] == "0.10.8"
     assert report["execution"]["uses_compressed_pages_directly"] is True
     assert report["execution"]["constructs_full_dense_kv"] is False
     assert report["timing"]["cuda_graph"]["enabled"] is False
@@ -1060,7 +1060,7 @@ def test_v0102_long_context_comparison_cpu_and_cli(capsys):
         cuda_graph=False,
     )
     report = run_long_context_comparison(cfg)
-    assert report["version"] == "long-context-comparison-v0.10.7"
+    assert report["version"] == "long-context-comparison-v0.10.8"
     assert len(report["rows"]) == 4
     assert report["summary"]["by_seq_len"]
     assert "production inference acceleration" in report["interpretation"]
@@ -1083,7 +1083,7 @@ def test_v0102_long_context_comparison_cpu_and_cli(capsys):
     ])
     out = capsys.readouterr().out
     assert rc == 0
-    assert "long-context-comparison-v0.10.7" in out
+    assert "long-context-comparison-v0.10.8" in out
     assert "recommended_preset" in out
 
 def test_v0104_split_k_comparison_cpu_and_cli(capsys):
@@ -1106,7 +1106,7 @@ def test_v0104_split_k_comparison_cpu_and_cli(capsys):
         split_k_slabs=(2, 4),
     )
     report = run_split_k_comparison(cfg)
-    assert report["version"] == "split-k-comparison-v0.10.7"
+    assert report["version"] == "split-k-comparison-v0.10.8"
     assert len(report["rows"]) == 2
     assert "split_k_projection" in report["rows"][0]
     assert report["summary"]["boundary"].startswith("This is a split-K")
@@ -1127,7 +1127,7 @@ def test_v0104_split_k_comparison_cpu_and_cli(capsys):
     ])
     assert rc == 0
     captured = capsys.readouterr().out
-    assert "split-k-comparison-v0.10.7" in captured
+    assert "split-k-comparison-v0.10.8" in captured
 
 
 def test_split_k_attention_reference_matches_compressed_reference():

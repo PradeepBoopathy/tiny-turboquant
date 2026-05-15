@@ -774,7 +774,7 @@ def build_parser() -> argparse.ArgumentParser:
     lc.set_defaults(func=long_context_compare)
 
 
-    sk = sub.add_parser("split-k-compare", help="v0.10.7 split-K / sequence-parallel measured diagnostic")
+    sk = sub.add_parser("split-k-compare", help="v0.10.8 split-K / sequence-parallel measured diagnostic")
     sk.add_argument("--batch-size", type=int, default=1)
     sk.add_argument("--heads", type=int, default=8)
     sk.add_argument("--query-len", type=int, default=1)

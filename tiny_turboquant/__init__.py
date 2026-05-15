@@ -208,7 +208,7 @@ __all__ = [
     "save_long_context_markdown",
 ]
 
-__version__ = "0.10.7"
+__version__ = "0.10.8"
 
 
 def __getattr__(name: str):
