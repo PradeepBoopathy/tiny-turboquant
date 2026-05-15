@@ -1218,7 +1218,7 @@ def test_v0110_end_to_end_decode_cpu_report_shape():
     )
     report = run_end_to_end_decode_benchmark(cfg)
 
-    assert report["version"] == "end-to-end-decode-v0.11.0"
+    assert report["version"] == "end-to-end-decode-v0.11.1"
     assert report["rows"][0]["prompt_len"] == 16
     assert "setup" in report["rows"][0]
     assert "sdpa_decode" in report["rows"][0]
@@ -1244,4 +1244,4 @@ def test_cli_end_to_end_decode_cpu_smoke(capsys):
     ])
     assert rc == 0
     captured = capsys.readouterr().out
-    assert "end-to-end-decode-v0.11.0" in captured
+    assert "end-to-end-decode-v0.11.1" in captured

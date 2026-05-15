@@ -576,6 +576,7 @@ def end_to_end_decode(args: argparse.Namespace) -> int:
         query_len=args.query_len,
         prompt_lens=tuple(int(x) for x in args.prompt_lens),
         decode_steps=args.decode_steps,
+        amortization_steps=tuple(int(x) for x in args.amortization_steps),
         head_dim=args.head_dim,
         page_size=args.page_size,
         preset=args.preset,
@@ -845,12 +846,13 @@ def build_parser() -> argparse.ArgumentParser:
     sk.set_defaults(func=split_k_compare)
 
 
-    ed = sub.add_parser("end-to-end-decode", help="v0.11.0 fixed-cache repeated decode-loop diagnostic")
+    ed = sub.add_parser("end-to-end-decode", help="fixed-cache repeated decode-loop and setup-amortization diagnostic")
     ed.add_argument("--batch-size", type=int, default=1)
     ed.add_argument("--heads", type=int, default=8)
     ed.add_argument("--query-len", type=int, default=1)
     ed.add_argument("--prompt-lens", nargs="+", type=int, default=[16384, 32768])
     ed.add_argument("--decode-steps", type=int, default=32)
+    ed.add_argument("--amortization-steps", nargs="+", type=int, default=[32, 128, 256, 512, 1024], help="decode-step counts used for setup amortization and break-even reporting")
     ed.add_argument("--head-dim", type=int, default=64)
     ed.add_argument("--page-size", type=int, default=256)
     ed.add_argument("--preset", type=str, default="safe-layout", choices=available_layout_presets())

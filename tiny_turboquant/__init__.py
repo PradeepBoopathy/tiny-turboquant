@@ -222,7 +222,7 @@ __all__ = [
     "save_end_to_end_decode_markdown",
 ]
 
-__version__ = "0.11.0"
+__version__ = "0.11.1"
 
 
 def __getattr__(name: str):

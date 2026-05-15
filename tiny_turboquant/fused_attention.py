@@ -1,12 +1,10 @@
 """Experimental fused compressed decode-attention research utilities.
 
-v0.10.9 extends the Triton fused compressed decode-attention prototype with
-CUDA Graph replay diagnostics on top of page-size/BLOCK_M sweep support for the affine safe-layout path.  The supported fast path remains intentionally narrow:
+This module contains experimental fused compressed decode-attention prototypes, split-K diagnostics, and fixed-cache decode-loop benchmarks.  The supported fast path remains intentionally narrow:
 query_len=1, batch_size=1, key_bits=8, affine per-page/per-channel K, and
 value_bits in {4, 6, 8}.  Unsupported configurations fall back to the
 quality-safe PyTorch compressed-page reference path and label that mode
-explicitly.  v0.10.9 reports normal fused timing, optional CUDA Graph replay timing, kernel block size, optional page-size sweep results, and speed/quality gaps
-against dense attention, SDPA, and the Python compressed-page reference path.
+explicitly. Reports include timing, quality, memory, setup/amortization, and speed/quality gaps against dense attention, SDPA, and Python reference paths.
 
 This module does not claim production inference acceleration.
 """
@@ -2302,7 +2300,7 @@ def save_split_k_markdown(report: Dict[str, Any], path: str | Path) -> None:
 
 @dataclass
 class EndToEndDecodeBenchConfig:
-    """Configuration for v0.11.0 fixed-cache end-to-end decode diagnostics.
+    """Configuration for fixed-cache end-to-end decode diagnostics.
 
     This is a synthetic decode-loop benchmark. It includes one-time compressed
     KV layout setup, prepared payload reuse, repeated decode-token execution,
@@ -2314,6 +2312,7 @@ class EndToEndDecodeBenchConfig:
     query_len: int = 1
     prompt_lens: Tuple[int, ...] = (16384, 32768)
     decode_steps: int = 32
+    amortization_steps: Tuple[int, ...] = (32, 128, 256, 512, 1024)
     head_dim: int = 64
     page_size: int = 256
     preset: Optional[str] = "safe-layout"
@@ -2365,6 +2364,84 @@ def _time_decode_loop(fn, *, device: str, warmup: int, repeats: int, decode_step
     assert out is not None
     return out, float(total / steps), float(total)
 
+
+
+
+def _positive_int_grid(values: Tuple[int, ...], fallback: int) -> Tuple[int, ...]:
+    cleaned = sorted({max(1, int(v)) for v in values})
+    return tuple(cleaned or (max(1, int(fallback)),))
+
+
+def _ceil_ratio(numerator: Optional[float], denominator: Optional[float]) -> Optional[int]:
+    if numerator is None or denominator is None:
+        return None
+    if denominator <= 0:
+        return None
+    return int((float(numerator) / float(denominator)) + 0.999999999)
+
+
+def _setup_amortization_report(
+    *,
+    setup_seconds: float,
+    table_build_seconds: float,
+    payload_prepare_seconds: float,
+    split_per_token: Optional[float],
+    sdpa_per_token: Optional[float],
+    steps: Tuple[int, ...],
+) -> Dict[str, Any]:
+    """Build setup amortization diagnostics from measured per-token timings.
+
+    This is intentionally a model over measured loop timings, not a new kernel
+    timing path. It answers how many decode steps are needed for setup cost to
+    be amortized when the compressed layout can be reused.
+    """
+    if split_per_token is None or sdpa_per_token is None:
+        return {
+            "available": False,
+            "reason": "split-K or SDPA per-token timing unavailable",
+            "steps": [],
+        }
+    per_token_saving = float(sdpa_per_token) - float(split_per_token)
+    payload_only_setup = float(payload_prepare_seconds)
+    rows = []
+    for n in _positive_int_grid(steps, 1):
+        sdpa_total = float(sdpa_per_token) * n
+        split_kernel_total = float(split_per_token) * n
+        split_full_setup_total = float(setup_seconds) + split_kernel_total
+        split_payload_only_setup_total = payload_only_setup + split_kernel_total
+        split_cached_layout_total = split_kernel_total
+        rows.append({
+            "decode_steps": n,
+            "sdpa_total_seconds": sdpa_total,
+            "split_k_kernel_only_total_seconds": split_kernel_total,
+            "split_k_with_full_setup_seconds": split_full_setup_total,
+            "split_k_with_payload_prepare_only_seconds": split_payload_only_setup_total,
+            "split_k_cached_layout_seconds": split_cached_layout_total,
+            "kernel_only_beats_sdpa": bool(split_kernel_total <= sdpa_total),
+            "full_setup_beats_sdpa": bool(split_full_setup_total <= sdpa_total),
+            "payload_prepare_only_beats_sdpa": bool(split_payload_only_setup_total <= sdpa_total),
+            "cached_layout_beats_sdpa": bool(split_cached_layout_total <= sdpa_total),
+            "full_setup_over_sdpa": _safe_ratio(split_full_setup_total, sdpa_total),
+            "payload_prepare_only_over_sdpa": _safe_ratio(split_payload_only_setup_total, sdpa_total),
+            "cached_layout_over_sdpa": _safe_ratio(split_cached_layout_total, sdpa_total),
+        })
+    return {
+        "available": True,
+        "table_build_seconds": float(table_build_seconds),
+        "payload_prepare_seconds": float(payload_prepare_seconds),
+        "full_setup_seconds": float(setup_seconds),
+        "split_k_seconds_per_token": float(split_per_token),
+        "sdpa_seconds_per_token": float(sdpa_per_token),
+        "per_token_saving_vs_sdpa_seconds": per_token_saving,
+        "break_even_decode_steps_full_setup": _ceil_ratio(setup_seconds, per_token_saving),
+        "break_even_decode_steps_payload_prepare_only": _ceil_ratio(payload_only_setup, per_token_saving),
+        "kernel_only_speedup_vs_sdpa_per_token": _safe_ratio(sdpa_per_token, split_per_token),
+        "steps": rows,
+        "interpretation": (
+            "Kernel-only rows exclude one-time setup. Full-setup rows include table build and payload preparation. "
+            "Payload-only rows model cached table reuse. Cached-layout rows model prepared payload reuse across decode sessions."
+        ),
+    }
 
 def _build_q_steps(config: EndToEndDecodeBenchConfig, prompt_len: int, device: str, dtype: torch.dtype) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     torch.manual_seed(int(config.seed) + int(prompt_len))
@@ -2649,6 +2726,14 @@ def run_end_to_end_decode_benchmark(config: EndToEndDecodeBenchConfig) -> Dict[s
             split_total_with_setup = (setup_seconds + float(split_loop_total)) if split_loop_total is not None else None
             split_amortized = (split_total_with_setup / max(1, int(config.decode_steps))) if split_total_with_setup is not None else None
             split_first_token_with_setup = (setup_seconds + float(split_per_token)) if split_per_token is not None else None
+            amortization = _setup_amortization_report(
+                setup_seconds=setup_seconds,
+                table_build_seconds=table_build_seconds,
+                payload_prepare_seconds=payload_prepare_seconds,
+                split_per_token=split_per_token,
+                sdpa_per_token=sdpa_per_token,
+                steps=tuple(getattr(config, "amortization_steps", (int(config.decode_steps),))),
+            )
 
             row = {
                 "prompt_len": int(prompt_len),
@@ -2701,6 +2786,7 @@ def run_end_to_end_decode_benchmark(config: EndToEndDecodeBenchConfig) -> Dict[s
                     "quality_vs_dense_last": attention_similarity(dense_last, split_last) if split_last is not None else None,
                     "kernel_loop_beats_sdpa": bool(split_per_token is not None and split_per_token <= sdpa_per_token),
                     "amortized_with_setup_beats_sdpa": bool(split_amortized is not None and split_amortized <= sdpa_per_token),
+                    "amortization": amortization,
                 },
                 "cuda_graph_decode": graph_report,
                 "boundary": "Fixed-cache synthetic decode-loop benchmark; not a full model serving benchmark.",
@@ -2718,29 +2804,38 @@ def run_end_to_end_decode_benchmark(config: EndToEndDecodeBenchConfig) -> Dict[s
         bool(r.get("split_k_decode", {}) and r["split_k_decode"].get("amortized_with_setup_beats_sdpa"))
         for r in rows if "error" not in r
     )
+    any_grid_full_setup_sdpa = any(
+        bool(step.get("full_setup_beats_sdpa"))
+        for r in rows if "error" not in r
+        for step in (((r.get("split_k_decode") or {}).get("amortization") or {}).get("steps") or [])
+    )
+    any_grid_payload_only_sdpa = any(
+        bool(step.get("payload_prepare_only_beats_sdpa"))
+        for r in rows if "error" not in r
+        for step in (((r.get("split_k_decode") or {}).get("amortization") or {}).get("steps") or [])
+    )
 
     return {
-        "version": "end-to-end-decode-v0.11.0",
+        "version": "end-to-end-decode-v0.11.1",
         "config": asdict(config),
         "warnings": warnings,
         "rows": rows,
         "summary": {
             "kernel_loop_verdict": "split-k-decode-loop-beats-sdpa-in-at-least-one-case" if any_kernel_sdpa else "split-k-decode-loop-not-competitive-yet",
-            "amortized_with_setup_verdict": "split-k-amortized-with-setup-beats-sdpa-in-at-least-one-case" if any_amortized_sdpa else "split-k-setup-cost-still-needs-amortization",
-            "measured_kernel_verdict": "v0.11.0 measures repeated decode steps with prepared payload reuse, setup accounting, and amortized per-token reporting",
+            "amortized_with_setup_verdict": "split-k-amortized-with-setup-beats-sdpa-in-at-least-one-case" if (any_amortized_sdpa or any_grid_full_setup_sdpa) else "split-k-setup-cost-still-needs-amortization",
+            "payload_only_setup_verdict": "split-k-payload-only-setup-beats-sdpa-in-grid" if any_grid_payload_only_sdpa else "payload-only-setup-still-needs-amortization",
+            "measured_kernel_verdict": "v0.11.1 measures repeated decode steps, setup-cost amortization, cached-layout reuse scenarios, and break-even decode lengths",
             "boundary": "This is a fixed-cache synthetic decode-loop diagnostic, not production LLM serving acceleration.",
         },
         "interpretation": (
-            "v0.11.0 moves beyond one-shot kernel timing by reporting setup cost, repeated decode-loop timing, "
-            "amortized per-token timing, and SDPA comparison. Prepared compressed payloads and output buffers are reused, "
-            "but this is still not a full model-serving benchmark."
+            "v0.11.1 reports fixed-cache decode-loop timing plus setup amortization grids. It separates full setup, payload-only setup, and cached-layout reuse scenarios, but this is still not a full model-serving benchmark."
         ),
     }
 
 
 def end_to_end_decode_markdown_report(report: Dict[str, Any]) -> str:
     lines = [
-        "# tiny-turboquant v0.11.0 end-to-end decode diagnostic",
+        "# tiny-turboquant end-to-end decode diagnostic",
         "",
         "This report measures fixed-cache repeated decode-loop behavior with setup accounting. It is not a full model-serving benchmark.",
         "",
@@ -2756,11 +2851,15 @@ def end_to_end_decode_markdown_report(report: Dict[str, Any]) -> str:
         split = row.get("split_k_decode") or {}
         sdpa = row.get("sdpa_decode") or {}
         setup = row.get("setup") or {}
+        amort = split.get("amortization") or {}
         lines.append(
             f"- prompt_len={row.get('prompt_len')}, decode_steps={row.get('decode_steps')}, "
             f"setup={setup.get('total_setup_seconds')}, sdpa/token={sdpa.get('seconds_per_token')}, "
             f"split_k/token={split.get('seconds_per_token')}, split_k_over_sdpa={split.get('over_sdpa_per_token')}, "
-            f"amortized_over_sdpa={split.get('amortized_over_sdpa_per_token')}, cos={((split.get('quality_vs_dense_last') or {}).get('cosine_similarity'))}"
+            f"amortized_over_sdpa={split.get('amortized_over_sdpa_per_token')}, "
+            f"break_even_full_setup={amort.get('break_even_decode_steps_full_setup')}, "
+            f"break_even_payload_only={amort.get('break_even_decode_steps_payload_prepare_only')}, "
+            f"cos={((split.get('quality_vs_dense_last') or {}).get('cosine_similarity'))}"
         )
     lines.extend(["", "## Boundary", "This is not a production acceleration claim."])
     return "\n".join(lines) + "\n"
