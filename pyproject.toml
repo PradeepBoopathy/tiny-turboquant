@@ -1,0 +1,84 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tiny-turboquant"
+version = "0.10.7"
+description = "Low-bit vector and KV-cache compression research toolkit for PyTorch"
+readme = "README.md"
+requires-python = ">=3.9"
+license = "MIT"
+authors = [
+  { name = "Pradeep Boopathy" }
+]
+keywords = [
+  "quantization",
+  "kv-cache",
+  "llm",
+  "compression",
+  "vector-search",
+  "pytorch",
+  "rag",
+  "transformers"
+]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Developers",
+  "Intended Audience :: Science/Research",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.9",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
+  "Topic :: Software Development :: Libraries :: Python Modules"
+]
+dependencies = [
+  "torch>=2.1",
+  "numpy>=1.24"
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8",
+  "build>=1.2",
+  "twine>=5.0",
+  "ruff>=0.5"
+]
+demos = [
+  "matplotlib>=3.7",
+  "faiss-cpu>=1.7.4",
+  "sentence-transformers>=2.6"
+]
+llm = [
+  "transformers>=4.40",
+  "accelerate>=0.30"
+]
+all = [
+  "matplotlib>=3.7",
+  "faiss-cpu>=1.7.4",
+  "sentence-transformers>=2.6",
+  "transformers>=4.40",
+  "accelerate>=0.30"
+]
+
+[project.scripts]
+tiny-tq = "tiny_turboquant.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/pradeepboopathy/tiny-turboquant"
+Repository = "https://github.com/pradeepboopathy/tiny-turboquant"
+Issues = "https://github.com/pradeepboopathy/tiny-turboquant/issues"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["tiny_turboquant*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+
+[tool.ruff]
+line-length = 100
+target-version = "py39"

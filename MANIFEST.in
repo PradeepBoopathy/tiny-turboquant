@@ -1,0 +1,8 @@
+include README.md
+include LICENSE
+recursive-include tiny_turboquant *.py
+recursive-include tests *.py
+recursive-include examples *.py
+recursive-include demos *.py
+recursive-include benchmarks *.py
+global-exclude __pycache__ *.py[cod] .DS_Store
